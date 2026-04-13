@@ -2,4 +2,3 @@ streamlit
 ultralytics
 opencv-python-headless
 numpy
-gunicorn
