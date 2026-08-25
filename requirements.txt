@@ -1,10 +1,11 @@
 ```txt
-streamlit
-streamlit-webrtc
+streamlit==1.51.0
+streamlit-webrtc==0.68.1
 ultralytics
 opencv-python-headless
-av
+av>=15.1.0
 numpy
 Pillow
 ```
+
 
