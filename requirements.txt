@@ -5,6 +5,9 @@ opencv-python-headless
 numpy
 Pillow
 av>=15.1.0
+lap>=0.5.13
+
+
 
 
 
