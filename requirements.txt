@@ -2,9 +2,9 @@ streamlit
 ultralytics
 opencv-python-headless
 numpy
-lap==0.5.13
 av
 streamlit-webrtc
+lap==0.5.13
 
 
 
