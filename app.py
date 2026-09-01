@@ -1,16 +1,16 @@
 import os
-import time
 import tempfile
-import threading
+from pathlib import Path
 
 import cv2
-import numpy as np
+import av
 import streamlit as st
 from ultralytics import YOLO
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -25,7 +25,28 @@ st.set_page_config(
 # ============================================================
 
 st.title("🚗 Vehicle Detection & Tracking")
-st.caption("AI-based vehicle detection, counting and live tracking")
+st.caption("YOLO-based vehicle detection, counting and live tracking")
+
+
+# ============================================================
+# LOAD YOLO MODEL
+# ============================================================
+
+MODEL_PATH = Path("yolov8n.pt")
+
+if not MODEL_PATH.exists():
+    st.error(
+        "❌ yolov8n.pt not found. "
+        "Please upload yolov8n.pt to the root of your GitHub repository."
+    )
+    st.stop()
+
+@st.cache_resource
+def load_model():
+    return YOLO(str(MODEL_PATH))
+
+
+model = load_model()
 
 
 # ============================================================
@@ -41,515 +62,225 @@ VEHICLE_CLASSES = {
 
 
 # ============================================================
-# LOAD MODEL
-# ============================================================
-
-@st.cache_resource
-def load_model():
-    model_path = "yolov8n.pt"
-
-    if not os.path.exists(model_path):
-        st.info("Downloading YOLOv8 model...")
-    
-    return YOLO(model_path)
-
-
-model = load_model()
-
-
-# ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.header("⚙️ Settings")
+st.sidebar.header("Select Input")
 
-input_type = st.sidebar.radio(
-    "Select Input",
-    ["Upload Video", "Live Webcam"],
-    index=0
-)
-
-confidence = st.sidebar.slider(
-    "Confidence",
-    min_value=0.10,
-    max_value=0.90,
-    value=0.35,
-    step=0.05
-)
-
-show_labels = st.sidebar.checkbox(
-    "Show Vehicle Labels",
-    value=True
-)
-
-show_ids = st.sidebar.checkbox(
-    "Show Tracking IDs",
-    value=True
+option = st.sidebar.radio(
+    "Input Type",
+    [
+        "Live Webcam",
+        "Upload Video"
+    ]
 )
 
 
 # ============================================================
-# VEHICLE COLORS
+# LIVE WEBCAM PROCESSOR
 # ============================================================
 
-def vehicle_color(class_id):
-    colors = {
-        2: (0, 255, 0),       # Car
-        3: (255, 0, 0),       # Motorcycle
-        5: (0, 165, 255),     # Bus
-        7: (255, 0, 255)      # Truck
-    }
+class VehicleTracker(VideoProcessorBase):
 
-    return colors.get(class_id, (255, 255, 255))
+    def __init__(self):
+        self.model = load_model()
 
+        self.total_current = 0
+        self.car_count = 0
+        self.motorcycle_count = 0
+        self.bus_count = 0
+        self.truck_count = 0
 
-# ============================================================
-# DRAW DETECTIONS
-# ============================================================
+    def recv(self, frame):
 
-def draw_tracking(frame, result):
+        # Convert WebRTC frame to OpenCV
+        img = frame.to_ndarray(format="bgr24")
 
-    output = frame.copy()
+        try:
 
-    counts = {
-        "Car": 0,
-        "Motorcycle": 0,
-        "Bus": 0,
-        "Truck": 0
-    }
+            # YOLO TRACKING
+            results = self.model.track(
+                img,
+                persist=True,
+                tracker="bytetrack.yaml",
+                classes=list(VEHICLE_CLASSES.keys()),
+                conf=0.35,
+                verbose=False
+            )
 
-    if result.boxes is None:
-        return output, counts, 0
+            result = results[0]
 
-    boxes = result.boxes
+            # Reset current counts
+            self.total_current = 0
+            self.car_count = 0
+            self.motorcycle_count = 0
+            self.bus_count = 0
+            self.truck_count = 0
 
-    total = 0
+            if result.boxes is not None:
 
-    for i in range(len(boxes)):
+                for box in result.boxes:
 
-        cls = int(boxes.cls[i].item())
-        conf = float(boxes.conf[i].item())
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
 
-        if cls not in VEHICLE_CLASSES:
-            continue
+                    if cls not in VEHICLE_CLASSES:
+                        continue
 
-        if conf < confidence:
-            continue
+                    self.total_current += 1
 
-        vehicle_name = VEHICLE_CLASSES[cls]
+                    # Vehicle type count
+                    if cls == 2:
+                        self.car_count += 1
 
-        counts[vehicle_name] += 1
-        total += 1
+                    elif cls == 3:
+                        self.motorcycle_count += 1
 
-        # ----------------------------------------------------
-        # BOX
-        # ----------------------------------------------------
+                    elif cls == 5:
+                        self.bus_count += 1
 
-        xyxy = boxes.xyxy[i].cpu().numpy().astype(int)
+                    elif cls == 7:
+                        self.truck_count += 1
 
-        x1, y1, x2, y2 = xyxy
+                    # Bounding box
+                    x1, y1, x2, y2 = map(
+                        int,
+                        box.xyxy[0].tolist()
+                    )
 
-        color = vehicle_color(cls)
+                    # Tracking ID
+                    track_id = None
 
-        cv2.rectangle(
-            output,
-            (x1, y1),
-            (x2, y2),
-            color,
-            2
-        )
+                    if box.id is not None:
+                        track_id = int(box.id[0])
 
-        # ----------------------------------------------------
-        # TRACKING ID
-        # ----------------------------------------------------
+                    label = VEHICLE_CLASSES[cls]
 
-        track_id = None
+                    if track_id is not None:
+                        text = f"{label} ID:{track_id} {conf:.2f}"
+                    else:
+                        text = f"{label} {conf:.2f}"
 
-        if boxes.id is not None:
-            track_id = int(boxes.id[i].item())
+                    # Draw bounding box
+                    cv2.rectangle(
+                        img,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0),
+                        2
+                    )
 
-        # ----------------------------------------------------
-        # LABEL
-        # ----------------------------------------------------
+                    # Text background
+                    (tw, th), _ = cv2.getTextSize(
+                        text,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        2
+                    )
 
-        label = ""
+                    cv2.rectangle(
+                        img,
+                        (x1, max(0, y1 - th - 10)),
+                        (x1 + tw + 5, y1),
+                        (0, 255, 0),
+                        -1
+                    )
 
-        if show_labels:
-            label = f"{vehicle_name} {conf:.2f}"
+                    # Label
+                    cv2.putText(
+                        img,
+                        text,
+                        (x1 + 2, max(15, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 0, 0),
+                        2
+                    )
 
-        if show_ids and track_id is not None:
-            label += f" | ID: {track_id}"
-
-        if label:
+            # =================================================
+            # TOP INFORMATION PANEL
+            # =================================================
 
             cv2.rectangle(
-                output,
-                (x1, max(0, y1 - 30)),
-                (x1 + max(120, len(label) * 9), y1),
-                color,
+                img,
+                (10, 10),
+                (350, 145),
+                (0, 0, 0),
                 -1
             )
 
             cv2.putText(
-                output,
-                label,
-                (x1 + 5, max(20, y1 - 8)),
+                img,
+                f"Vehicles: {self.total_current}",
+                (25, 45),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 0, 0),
-                2,
-                cv2.LINE_AA
+                0.8,
+                (0, 255, 255),
+                2
             )
 
-    # ========================================================
-    # INFORMATION PANEL
-    # ========================================================
+            cv2.putText(
+                img,
+                f"Cars: {self.car_count}",
+                (25, 75),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2
+            )
 
-    panel_text = (
-        f"Vehicles: {total} | "
-        f"Cars: {counts['Car']} | "
-        f"Motorcycles: {counts['Motorcycle']} | "
-        f"Buses: {counts['Bus']} | "
-        f"Trucks: {counts['Truck']}"
-    )
+            cv2.putText(
+                img,
+                f"Motorcycles: {self.motorcycle_count}",
+                (25, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2
+            )
 
-    cv2.rectangle(
-        output,
-        (10, 10),
-        (min(output.shape[1] - 10, 850), 50),
-        (20, 20, 20),
-        -1
-    )
+            cv2.putText(
+                img,
+                f"Bus: {self.bus_count}  Truck: {self.truck_count}",
+                (25, 125),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2
+            )
 
-    cv2.putText(
-        output,
-        panel_text,
-        (20, 38),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA
-    )
+        except Exception as e:
 
-    return output, counts, total
+            cv2.putText(
+                img,
+                f"Tracking Error: {str(e)[:60]}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2
+            )
 
-
-# ============================================================
-# UPLOAD VIDEO
-# ============================================================
-
-if input_type == "Upload Video":
-
-    st.header("🎥 Upload Video")
-
-    uploaded_file = st.file_uploader(
-        "Choose a vehicle video",
-        type=["mp4", "avi", "mov", "mkv"],
-        help="Upload a road/traffic video for vehicle detection and tracking."
-    )
-
-    if uploaded_file is not None:
-
-        # ----------------------------------------------------
-        # SAVE TEMP VIDEO
-        # ----------------------------------------------------
-
-        suffix = os.path.splitext(uploaded_file.name)[1]
-
-        temp_input = tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix
+        # Return processed frame
+        return av.VideoFrame.from_ndarray(
+            img,
+            format="bgr24"
         )
-
-        temp_input.write(uploaded_file.read())
-        temp_input.close()
-
-        # ----------------------------------------------------
-        # SHOW ORIGINAL VIDEO
-        # ----------------------------------------------------
-
-        st.subheader("🎬 Original Video")
-
-        st.video(uploaded_file)
-
-        # ----------------------------------------------------
-        # START BUTTON
-        # ----------------------------------------------------
-
-        start_tracking = st.button(
-            "▶️ Start Video Tracking",
-            type="primary"
-        )
-
-        if start_tracking:
-
-            cap = cv2.VideoCapture(temp_input.name)
-
-            if not cap.isOpened():
-
-                st.error("❌ Could not open the uploaded video.")
-
-            else:
-
-                total_frames = int(
-                    cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                )
-
-                fps = cap.get(
-                    cv2.CAP_PROP_FPS
-                )
-
-                if fps <= 0:
-                    fps = 25
-
-                width = int(
-                    cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-                )
-
-                height = int(
-                    cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                )
-
-                st.subheader("🚘 Live Video Tracking")
-
-                frame_placeholder = st.empty()
-
-                progress_bar = st.progress(0)
-
-                status = st.empty()
-
-                # ------------------------------------------------
-                # METRICS
-                # ------------------------------------------------
-
-                col1, col2, col3, col4, col5 = st.columns(5)
-
-                metric_total = col1.empty()
-                metric_car = col2.empty()
-                metric_motorcycle = col3.empty()
-                metric_bus = col4.empty()
-                metric_truck = col5.empty()
-
-                frame_number = 0
-
-                max_seen = {
-                    "Car": 0,
-                    "Motorcycle": 0,
-                    "Bus": 0,
-                    "Truck": 0
-                }
-
-                # ------------------------------------------------
-                # PROCESS VIDEO
-                # ------------------------------------------------
-
-                while True:
-
-                    success, frame = cap.read()
-
-                    if not success:
-                        break
-
-                    frame_number += 1
-
-                    # ------------------------------------------------
-                    # YOLO TRACKING
-                    #
-                    # IMPORTANT:
-                    # ByteTrack is used instead of BoT-SORT.
-                    # This avoids the previous "No module named lap"
-                    # error.
-                    # ------------------------------------------------
-
-                    results = model.track(
-                        frame,
-                        persist=True,
-                        tracker="bytetrack.yaml",
-                        conf=confidence,
-                        verbose=False
-                    )
-
-                    result = results[0]
-
-                    processed_frame, counts, total = draw_tracking(
-                        frame,
-                        result
-                    )
-
-                    # ------------------------------------------------
-                    # UPDATE METRICS
-                    # ------------------------------------------------
-
-                    for key in max_seen:
-                        max_seen[key] = max(
-                            max_seen[key],
-                            counts[key]
-                        )
-
-                    metric_total.metric(
-                        "Current Vehicles",
-                        total
-                    )
-
-                    metric_car.metric(
-                        "Cars",
-                        counts["Car"]
-                    )
-
-                    metric_motorcycle.metric(
-                        "Motorcycles",
-                        counts["Motorcycle"]
-                    )
-
-                    metric_bus.metric(
-                        "Buses",
-                        counts["Bus"]
-                    )
-
-                    metric_truck.metric(
-                        "Trucks",
-                        counts["Truck"]
-                    )
-
-                    # ------------------------------------------------
-                    # DISPLAY FRAME
-                    # ------------------------------------------------
-
-                    processed_rgb = cv2.cvtColor(
-                        processed_frame,
-                        cv2.COLOR_BGR2RGB
-                    )
-
-                    frame_placeholder.image(
-                        processed_rgb,
-                        channels="RGB",
-                        use_container_width=True
-                    )
-
-                    # ------------------------------------------------
-                    # PROGRESS
-                    # ------------------------------------------------
-
-                    if total_frames > 0:
-
-                        progress = min(
-                            frame_number / total_frames,
-                            1.0
-                        )
-
-                        progress_bar.progress(progress)
-
-                    status.write(
-                        f"Processing frame {frame_number}"
-                        f" / {total_frames}"
-                    )
-
-                    # ------------------------------------------------
-                    # CONTROL PLAYBACK SPEED
-                    # ------------------------------------------------
-
-                    time.sleep(
-                        max(0.001, 1 / fps)
-                    )
-
-                cap.release()
-
-                progress_bar.progress(1.0)
-
-                st.success(
-                    "✅ Video tracking completed successfully!"
-                )
-
-                st.subheader("📊 Maximum Vehicles Detected")
-
-                c1, c2, c3, c4 = st.columns(4)
-
-                c1.metric(
-                    "Cars",
-                    max_seen["Car"]
-                )
-
-                c2.metric(
-                    "Motorcycles",
-                    max_seen["Motorcycle"]
-                )
-
-                c3.metric(
-                    "Buses",
-                    max_seen["Bus"]
-                )
-
-                c4.metric(
-                    "Trucks",
-                    max_seen["Truck"]
-                )
-
-        # ----------------------------------------------------
-        # DELETE TEMP FILE
-        # ----------------------------------------------------
-
-        try:
-            os.unlink(temp_input.name)
-        except Exception:
-            pass
 
 
 # ============================================================
 # LIVE WEBCAM
 # ============================================================
 
-else:
+if option == "Live Webcam":
 
-    st.header("📹 Live Webcam Tracking")
+    st.subheader("📹 Live Vehicle Tracking")
 
     st.info(
-        "Allow camera permission when your browser asks."
+        "Click START and allow camera permission in your browser."
     )
 
-    # --------------------------------------------------------
-    # Import WebRTC only in webcam mode
-    # --------------------------------------------------------
-
-    try:
-
-        import av
-
-        from streamlit_webrtc import (
-            webrtc_streamer,
-            VideoProcessorBase,
-            RTCConfiguration
-        )
-
-    except Exception as e:
-
-        st.error(
-            "Webcam dependencies are not installed."
-        )
-
-        st.code(
-            "streamlit-webrtc==0.77.0\n"
-            "av==14.2.0"
-        )
-
-        st.warning(
-            f"Dependency error: {e}"
-        )
-
-        st.stop()
-
-
-    # --------------------------------------------------------
-    # THREAD LOCK
-    # --------------------------------------------------------
-
-    model_lock = threading.Lock()
-
-
-    # --------------------------------------------------------
-    # WEBRTC CONFIG
-    # --------------------------------------------------------
-
+    # WebRTC configuration
     RTC_CONFIGURATION = RTCConfiguration(
         {
             "iceServers": [
@@ -562,71 +293,9 @@ else:
         }
     )
 
-
-    # --------------------------------------------------------
-    # VIDEO PROCESSOR
-    # --------------------------------------------------------
-
-    class VehicleVideoProcessor(VideoProcessorBase):
-
-        def __init__(self):
-
-            self.vehicle_count = 0
-
-        def recv(self, frame):
-
-            img = frame.to_ndarray(
-                format="bgr24"
-            )
-
-            try:
-
-                with model_lock:
-
-                    results = model.track(
-                        img,
-                        persist=True,
-                        tracker="bytetrack.yaml",
-                        conf=confidence,
-                        verbose=False
-                    )
-
-                result = results[0]
-
-                processed, counts, total = draw_tracking(
-                    img,
-                    result
-                )
-
-                self.vehicle_count = total
-
-            except Exception as e:
-
-                cv2.putText(
-                    img,
-                    f"Tracking error: {str(e)[:60]}",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2
-                )
-
-                processed = img
-
-            return av.VideoFrame.from_ndarray(
-                processed,
-                format="bgr24"
-            )
-
-
-    # --------------------------------------------------------
-    # START WEBCAM
-    # --------------------------------------------------------
-
-    webrtc_ctx = webrtc_streamer(
-        key="vehicle-live-tracking",
-        video_processor_factory=VehicleVideoProcessor,
+    ctx = webrtc_streamer(
+        key="vehicle-tracking-webcam",
+        video_processor_factory=VehicleTracker,
         rtc_configuration=RTC_CONFIGURATION,
         media_stream_constraints={
             "video": True,
@@ -635,36 +304,512 @@ else:
         async_processing=True
     )
 
-
     st.markdown("---")
 
-    st.subheader("🚗 Live Tracking")
+    st.subheader("📊 Live Detection")
 
-    if webrtc_ctx.state.playing:
+    col1, col2, col3, col4 = st.columns(4)
 
-        st.success(
-            "🟢 Live vehicle tracking is running."
-        )
+    if ctx.video_processor:
 
-        st.write(
-            "The YOLO model is detecting and tracking "
-            "vehicles from your webcam."
-        )
+        processor = ctx.video_processor
+
+        with col1:
+            st.metric(
+                "Vehicles",
+                processor.total_current
+            )
+
+        with col2:
+            st.metric(
+                "Cars",
+                processor.car_count
+            )
+
+        with col3:
+            st.metric(
+                "Motorcycles",
+                processor.motorcycle_count
+            )
+
+        with col4:
+            st.metric(
+                "Bus / Truck",
+                processor.bus_count + processor.truck_count
+            )
 
     else:
 
-        st.warning(
-            "Click START above and allow camera permission."
+        with col1:
+            st.metric("Vehicles", 0)
+
+        with col2:
+            st.metric("Cars", 0)
+
+        with col3:
+            st.metric("Motorcycles", 0)
+
+        with col4:
+            st.metric("Bus / Truck", 0)
+
+
+# ============================================================
+# UPLOAD VIDEO
+# ============================================================
+
+else:
+
+    st.subheader("🎥 Upload Video")
+
+    uploaded_file = st.file_uploader(
+        "Choose a video",
+        type=[
+            "mp4",
+            "avi",
+            "mov",
+            "mkv"
+        ]
+    )
+
+    if uploaded_file is not None:
+
+        # Save uploaded video temporarily
+        suffix = Path(uploaded_file.name).suffix
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix
+        ) as temp_file:
+
+            temp_file.write(
+                uploaded_file.read()
+            )
+
+            video_path = temp_file.name
+
+        st.success(
+            f"Video uploaded: {uploaded_file.name}"
         )
 
+        # ====================================================
+        # VIDEO INFORMATION
+        # ====================================================
 
-# ============================================================
-# FOOTER
-# ============================================================
+        cap = cv2.VideoCapture(video_path)
 
-st.markdown("---")
+        if not cap.isOpened():
 
-st.caption(
-    "🚗 AI Vehicle Detection & Tracking | "
-    "YOLOv8 + ByteTrack + Streamlit"
-)
+            st.error(
+                "❌ Unable to open uploaded video."
+            )
+
+            st.stop()
+
+        fps = cap.get(
+            cv2.CAP_PROP_FPS
+        )
+
+        if fps <= 0:
+            fps = 25
+
+        total_frames = int(
+            cap.get(
+                cv2.CAP_PROP_FRAME_COUNT
+            )
+        )
+
+        width = int(
+            cap.get(
+                cv2.CAP_PROP_FRAME_WIDTH
+            )
+        )
+
+        height = int(
+            cap.get(
+                cv2.CAP_PROP_FRAME_HEIGHT
+            )
+        )
+
+        duration = (
+            total_frames / fps
+            if fps > 0
+            else 0
+        )
+
+        st.write(
+            f"**Resolution:** {width} × {height}"
+        )
+
+        st.write(
+            f"**FPS:** {fps:.2f}"
+        )
+
+        st.write(
+            f"**Duration:** {duration:.1f} seconds"
+        )
+
+        st.markdown("---")
+
+        # ====================================================
+        # OUTPUT AREA
+        # ====================================================
+
+        st.subheader("🤖 Vehicle Tracking Output")
+
+        video_placeholder = st.empty()
+
+        progress_bar = st.progress(0)
+
+        count_placeholder = st.empty()
+
+        # Current frame count
+        frame_number = 0
+
+        # Maximum unique tracking IDs
+        unique_ids = set()
+
+        # Vehicle type totals
+        total_cars = 0
+        total_motorcycles = 0
+        total_buses = 0
+        total_trucks = 0
+
+        # ====================================================
+        # PROCESS VIDEO
+        # ====================================================
+
+        while True:
+
+            ret, frame = cap.read()
+
+            if not ret:
+                break
+
+            frame_number += 1
+
+            try:
+
+                # YOLO tracking
+                results = model.track(
+                    frame,
+                    persist=True,
+                    tracker="bytetrack.yaml",
+                    classes=list(VEHICLE_CLASSES.keys()),
+                    conf=0.35,
+                    verbose=False
+                )
+
+                result = results[0]
+
+                current_count = 0
+
+                current_cars = 0
+                current_motorcycles = 0
+                current_buses = 0
+                current_trucks = 0
+
+                if result.boxes is not None:
+
+                    for box in result.boxes:
+
+                        cls = int(
+                            box.cls[0]
+                        )
+
+                        conf = float(
+                            box.conf[0]
+                        )
+
+                        if cls not in VEHICLE_CLASSES:
+                            continue
+
+                        current_count += 1
+
+                        # ====================================
+                        # VEHICLE TYPE
+                        # ====================================
+
+                        if cls == 2:
+                            current_cars += 1
+
+                        elif cls == 3:
+                            current_motorcycles += 1
+
+                        elif cls == 5:
+                            current_buses += 1
+
+                        elif cls == 7:
+                            current_trucks += 1
+
+                        # ====================================
+                        # TRACKING ID
+                        # ====================================
+
+                        track_id = None
+
+                        if box.id is not None:
+
+                            track_id = int(
+                                box.id[0]
+                            )
+
+                            unique_ids.add(
+                                track_id
+                            )
+
+                        # ====================================
+                        # BOUNDING BOX
+                        # ====================================
+
+                        x1, y1, x2, y2 = map(
+                            int,
+                            box.xyxy[0].tolist()
+                        )
+
+                        label = VEHICLE_CLASSES[cls]
+
+                        if track_id is not None:
+
+                            text = (
+                                f"{label} "
+                                f"ID:{track_id} "
+                                f"{conf:.2f}"
+                            )
+
+                        else:
+
+                            text = (
+                                f"{label} "
+                                f"{conf:.2f}"
+                            )
+
+                        # Draw box
+                        cv2.rectangle(
+                            frame,
+                            (x1, y1),
+                            (x2, y2),
+                            (0, 255, 0),
+                            2
+                        )
+
+                        # Text size
+                        (tw, th), _ = cv2.getTextSize(
+                            text,
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            2
+                        )
+
+                        # Text background
+                        cv2.rectangle(
+                            frame,
+                            (
+                                x1,
+                                max(
+                                    0,
+                                    y1 - th - 10
+                                )
+                            ),
+                            (
+                                x1 + tw + 5,
+                                y1
+                            ),
+                            (0, 255, 0),
+                            -1
+                        )
+
+                        # Text
+                        cv2.putText(
+                            frame,
+                            text,
+                            (
+                                x1 + 2,
+                                max(
+                                    15,
+                                    y1 - 5
+                                )
+                            ),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (0, 0, 0),
+                            2
+                        )
+
+                # =================================================
+                # TOP INFORMATION PANEL
+                # =================================================
+
+                cv2.rectangle(
+                    frame,
+                    (10, 10),
+                    (390, 175),
+                    (0, 0, 0),
+                    -1
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Vehicles: {current_count}",
+                    (25, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Unique IDs: {len(unique_ids)}",
+                    (25, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Cars: {current_cars}",
+                    (25, 105),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Motorcycles: {current_motorcycles}",
+                    (25, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Bus: {current_buses}  Truck: {current_trucks}",
+                    (25, 155),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+                # =================================================
+                # SHOW FRAME
+                # =================================================
+
+                frame_rgb = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2RGB
+                )
+
+                video_placeholder.image(
+                    frame_rgb,
+                    channels="RGB",
+                    use_container_width=True
+                )
+
+                # =================================================
+                # COUNTERS
+                # =================================================
+
+                with count_placeholder.container():
+
+                    c1, c2, c3, c4, c5 = st.columns(5)
+
+                    c1.metric(
+                        "Current Vehicles",
+                        current_count
+                    )
+
+                    c2.metric(
+                        "Unique Vehicles",
+                        len(unique_ids)
+                    )
+
+                    c3.metric(
+                        "Cars",
+                        current_cars
+                    )
+
+                    c4.metric(
+                        "Motorcycles",
+                        current_motorcycles
+                    )
+
+                    c5.metric(
+                        "Bus + Truck",
+                        current_buses + current_trucks
+                    )
+
+                # =================================================
+                # PROGRESS
+                # =================================================
+
+                if total_frames > 0:
+
+                    progress = min(
+                        frame_number / total_frames,
+                        1.0
+                    )
+
+                    progress_bar.progress(
+                        progress
+                    )
+
+            except Exception as e:
+
+                st.error(
+                    f"Tracking error: {e}"
+                )
+
+                break
+
+        # ====================================================
+        # RELEASE VIDEO
+        # ====================================================
+
+        cap.release()
+
+        progress_bar.progress(1.0)
+
+        st.success(
+            "✅ Video processing completed!"
+        )
+
+        # ====================================================
+        # FINAL RESULT
+        # ====================================================
+
+        st.markdown("---")
+
+        st.subheader("📊 Tracking Summary")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Unique Vehicles Tracked",
+                len(unique_ids)
+            )
+
+        with col2:
+            st.metric(
+                "Frames Processed",
+                frame_number
+            )
+
+        with col3:
+            st.metric(
+                "Video Duration",
+                f"{duration:.1f}s"
+            )
+
+        # Delete temporary video
+        try:
+            os.unlink(video_path)
+        except Exception:
+            pass
